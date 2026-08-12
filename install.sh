@@ -2,7 +2,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-INSTALL_PATH="$HOME/.local/bin/kb-debounce.py"
+INSTALL_PATH="$HOME/.local/bin/kb-debounce"
 SERVICE_PATH="$HOME/.config/systemd/user/kb-debounce.service"
 
 echo "kb-debounce installer"
@@ -35,7 +35,7 @@ fi
 # Detect keyboard
 echo "Detecting keyboards..."
 echo ""
-python3 "$SCRIPT_DIR/kb-debounce.py" --list
+"$SCRIPT_DIR/kb-debounce" --list
 echo ""
 
 # Prompt for keyboard name
@@ -45,12 +45,12 @@ THRESHOLD="${THRESHOLD:-75}"
 
 # Install script
 mkdir -p "$(dirname "$INSTALL_PATH")"
-cp "$SCRIPT_DIR/kb-debounce.py" "$INSTALL_PATH"
+cp "$SCRIPT_DIR/kb-debounce" "$INSTALL_PATH"
 chmod +x "$INSTALL_PATH"
 echo "Installed script to $INSTALL_PATH"
 
 # Build ExecStart line
-EXEC_START="/usr/bin/python3 $INSTALL_PATH --threshold $THRESHOLD"
+EXEC_START="$INSTALL_PATH --threshold $THRESHOLD"
 if [ -n "$KB_NAME" ]; then
     EXEC_START="$EXEC_START --name '$KB_NAME'"
 fi
