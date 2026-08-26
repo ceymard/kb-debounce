@@ -44,6 +44,19 @@
      (1UL << ((bit) % (8 * sizeof(long)))))
 #endif
 
+#ifndef set_bit
+#define set_bit(bit, array) \
+    ((array)[(bit) / (8 * sizeof(long))] |= (1UL << ((bit) % (8 * sizeof(long)))))
+#endif
+
+#ifndef clear_bit
+#define clear_bit(bit, array) \
+    ((array)[(bit) / (8 * sizeof(long))] &= ~(1UL << ((bit) % (8 * sizeof(long)))))
+#endif
+
+#define KEY_STATE_BYTES ((KEY_MAX + 7) / 8)
+#define EVENT_BATCH_SIZE 64
+
 static volatile sig_atomic_t keep_running = 1;
 
 static void on_signal(int sig)
@@ -407,13 +420,19 @@ static bool find_keyboard(const char *name_fragment, char *path, size_t path_siz
 
 static void write_event(int uinput_fd, const struct input_event *event)
 {
-    if (write(uinput_fd, event, sizeof(*event)) != (ssize_t)sizeof(*event)) {
+    ssize_t n;
+
+    do {
+        n = write(uinput_fd, event, sizeof(*event));
+    } while (n < 0 && errno == EINTR);
+
+    if (n != (ssize_t)sizeof(*event)) {
         perror("write uinput event");
         keep_running = 0;
     }
 }
 
-static void syn_event(int uinput_fd)
+static void syn_report(int uinput_fd)
 {
     struct input_event syn = {
         .type = EV_SYN,
@@ -424,6 +443,107 @@ static void syn_event(int uinput_fd)
     write_event(uinput_fd, &syn);
 }
 
+static void sync_key_state(int src_fd, int uinput_fd, unsigned char *key_state)
+{
+    unsigned char src_state[KEY_STATE_BYTES];
+
+    memset(src_state, 0, sizeof(src_state));
+    if (ioctl(src_fd, EVIOCGKEY((int)sizeof(src_state)), src_state) < 0) {
+        perror("EVIOCGKEY");
+        return;
+    }
+
+    for (int code = 0; code <= KEY_MAX; code++) {
+        bool src_pressed = test_bit(code, src_state);
+        bool out_pressed = test_bit(code, key_state);
+
+        if (src_pressed == out_pressed) {
+            continue;
+        }
+
+        struct input_event ev = {
+            .type = EV_KEY,
+            .code = (uint16_t)code,
+            .value = src_pressed ? 1 : 0,
+        };
+
+        write_event(uinput_fd, &ev);
+        if (src_pressed) {
+            set_bit(code, key_state);
+        } else {
+            clear_bit(code, key_state);
+        }
+    }
+
+    syn_report(uinput_fd);
+}
+
+static bool should_forward_key_down(unsigned int code, double now, double debounce_s,
+                                    double *last_down)
+{
+    if (code > KEY_MAX) {
+        return true;
+    }
+
+    if ((now - last_down[code]) < debounce_s) {
+        return false;
+    }
+
+    last_down[code] = now;
+    return true;
+}
+
+static void update_key_state(unsigned char *key_state, const struct input_event *event)
+{
+    unsigned int code = event->code;
+
+    if (code > KEY_MAX) {
+        return;
+    }
+
+    if (event->value == 0) {
+        clear_bit(code, key_state);
+    } else if (event->value == 1) {
+        set_bit(code, key_state);
+    }
+}
+
+static bool process_event(int kbd_fd, int uinput_fd, const struct input_event *event,
+                          double debounce_s, double *last_down, unsigned char *key_state,
+                          bool *drop_until_syn)
+{
+    if (*drop_until_syn) {
+        if (event->type == EV_SYN && event->code == SYN_REPORT) {
+            *drop_until_syn = false;
+            sync_key_state(kbd_fd, uinput_fd, key_state);
+        }
+        return false;
+    }
+
+    if (event->type == EV_SYN && event->code == SYN_DROPPED) {
+        *drop_until_syn = true;
+        return false;
+    }
+
+    if (event->type == EV_KEY) {
+        unsigned int code = event->code;
+
+        if (event->value == 1) {
+            if (!should_forward_key_down(code, monotonic_seconds(), debounce_s, last_down)) {
+                return false;
+            }
+        } else if (event->value == 0 && code <= KEY_MAX) {
+            last_down[code] = 0.0;
+        }
+    }
+
+    write_event(uinput_fd, event);
+    if (event->type == EV_KEY) {
+        update_key_state(key_state, event);
+    }
+    return true;
+}
+
 static void run(int debounce_ms, const char *device_path, const char *name_fragment)
 {
     char path[PATH_MAX];
@@ -432,6 +552,8 @@ static void run(int debounce_ms, const char *device_path, const char *name_fragm
     int uinput_fd = -1;
     double debounce_s = debounce_ms / 1000.0;
     double *last_down = NULL;
+    unsigned char *key_state = NULL;
+    bool drop_until_syn = false;
 
     if (device_path) {
         snprintf(path, sizeof(path), "%s", device_path);
@@ -454,7 +576,7 @@ static void run(int debounce_ms, const char *device_path, const char *name_fragm
 
     printf("Debouncing: %s (%s), threshold=%dms\n", name, path, debounce_ms);
 
-    uinput_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    uinput_fd = open("/dev/uinput", O_WRONLY);
     if (uinput_fd < 0) {
         perror("open /dev/uinput");
         close(kbd_fd);
@@ -476,8 +598,11 @@ static void run(int debounce_ms, const char *device_path, const char *name_fragm
     }
 
     last_down = calloc((size_t)KEY_MAX + 1, sizeof(double));
-    if (!last_down) {
+    key_state = calloc(KEY_STATE_BYTES, 1);
+    if (!last_down || !key_state) {
         perror("calloc");
+        free(last_down);
+        free(key_state);
         ioctl(kbd_fd, EVIOCGRAB, 0);
         ioctl(uinput_fd, UI_DEV_DESTROY);
         close(uinput_fd);
@@ -489,37 +614,34 @@ static void run(int debounce_ms, const char *device_path, const char *name_fragm
     signal(SIGTERM, on_signal);
 
     while (keep_running) {
-        struct input_event event;
+        struct input_event events[EVENT_BATCH_SIZE];
+        ssize_t nbytes;
+        int count;
 
-        ssize_t n = read(kbd_fd, &event, sizeof(event));
-        if (n < 0) {
+        nbytes = read(kbd_fd, events, sizeof(events));
+        if (nbytes < 0) {
             if (errno == EINTR) {
                 continue;
             }
             perror("read keyboard");
             break;
         }
-        if (n != (ssize_t)sizeof(event)) {
+        if (nbytes == 0) {
+            continue;
+        }
+        if (nbytes % (ssize_t)sizeof(struct input_event) != 0) {
             fprintf(stderr, "Short read from keyboard\n");
             break;
         }
 
-        if (event.type == EV_KEY && event.value == 1) {
-            double now = monotonic_seconds();
-            unsigned int code = event.code;
-
-            if (code <= KEY_MAX && (now - last_down[code]) < debounce_s) {
-                continue;
-            }
-            if (code <= KEY_MAX) {
-                last_down[code] = now;
-            }
+        count = (int)(nbytes / (ssize_t)sizeof(struct input_event));
+        for (int i = 0; i < count && keep_running; i++) {
+            process_event(kbd_fd, uinput_fd, &events[i], debounce_s, last_down,
+                          key_state, &drop_until_syn);
         }
-
-        write_event(uinput_fd, &event);
-        syn_event(uinput_fd);
     }
 
+    free(key_state);
     free(last_down);
     ioctl(kbd_fd, EVIOCGRAB, 0);
     ioctl(uinput_fd, UI_DEV_DESTROY);
